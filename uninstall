@@ -1,0 +1,209 @@
+#!/bin/sh
+
+# Uninstall Xray-core and transparent proxy
+
+set -e
+
+# Source shared library
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "${SCRIPT_DIR}/scripts/lib/logging.sh"
+. "${SCRIPT_DIR}/scripts/lib/common.sh"
+
+# =============================================================================
+# Argument parsing
+# =============================================================================
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-h | --help)
+		echo "Usage: $0 [OPTIONS]"
+		echo ""
+		echo "Options:"
+		echo "  -h, --help       Show this help message"
+		echo ""
+		echo "This script will:"
+		echo "  - Stop xray service and remove transparent proxy"
+		echo "  - Remove xray binary, init scripts, and geo databases"
+		echo "  - Remove xray logs and configuration file"
+		echo ""
+		exit 0
+		;;
+	*)
+		log_error "Unknown option: $1"
+		echo "Use --help for usage information"
+		exit 1
+		;;
+	esac
+done
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# OpenWrt paths
+BINARY_DIR="/usr/bin"
+CONFIG_DIR="/etc/xray"
+LOG_DIR="/var/log/xray"
+INIT_DIR="/etc/init.d"
+
+# =============================================================================
+# Confirmation
+# =============================================================================
+
+echo ""
+echo "============================================"
+echo "          Xray-core Uninstaller"
+echo "============================================"
+echo ""
+echo "This will:"
+echo "  - Stop xray service and remove transparent proxy"
+echo "  - Remove xray binary, init scripts, and geo databases"
+echo "  - Remove xray logs and configuration file"
+echo ""
+echo "Type 'yes' to continue or anything else to cancel:"
+read -r CONFIRM
+if [ "${CONFIRM}" != "yes" ]; then
+	echo "Uninstall cancelled"
+	exit 0
+fi
+
+# =============================================================================
+# Disable xray service and stop xray process
+# =============================================================================
+
+# Stop and disable xray service
+if [ -f ${INIT_DIR}/xray ]; then
+	if ${INIT_DIR}/xray status >/dev/null 2>&1; then
+		log_info "Stopping xray service..."
+		${INIT_DIR}/xray stop
+	fi
+	${INIT_DIR}/xray disable 2>/dev/null || true
+	log_success "xray service stopped and disabled"
+else
+	log_info "xray service not installed"
+fi
+
+# Kill any remaining xray processes
+if pidof xray >/dev/null 2>&1; then
+	log_warn "Found running xray process, killing it..."
+	killall -9 xray 2>/dev/null || true
+fi
+
+# =============================================================================
+# Remove TPROXY Rules
+# =============================================================================
+
+# Detect LAN interface
+LAN_IFACE=$(ip route | grep -E "192.168.0.0/16|172.16.0.0/12|10.0.0.0/8" | grep -v "default" | awk '{print $3}' | head -1)
+[ -z "$LAN_IFACE" ] && LAN_IFACE="br-lan"
+
+# Remove PREROUTING rule from detected interface only
+iptables -t mangle -D PREROUTING -i "$LAN_IFACE" -j XRAY_TPROXY 2>/dev/null || true
+
+# Flush and remove XRAY_TPROXY chain
+iptables -t mangle -F XRAY_TPROXY 2>/dev/null || true
+iptables -t mangle -X XRAY_TPROXY 2>/dev/null || true
+
+log_success "TPROXY iptables rules removed"
+
+# Remove policy routing
+ip rule del fwmark 1 lookup 100 2>/dev/null || true
+ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
+
+log_success "TPROXY policy routing removed"
+
+# =============================================================================
+# Remove Init Scripts
+# =============================================================================
+
+# Remove xray service in /etc/init.d/
+if [ -f ${INIT_DIR}/xray ]; then
+	rm -f ${INIT_DIR}/xray
+	log_success "Removed ${INIT_DIR}/xray"
+fi
+
+log_success "Init scripts removed"
+
+# =============================================================================
+# Remove TPROXY Script
+# =============================================================================
+
+# Remove transparent proxy script
+if [ -f /usr/bin/xray-tproxy ]; then
+	rm -f /usr/bin/xray-tproxy
+	log_success "Removed /usr/bin/xray-tproxy"
+fi
+
+# Remove xray-tproxy from rc.local
+if [ -f /etc/rc.local ]; then
+	TPROXY_LINE="/usr/bin/xray-tproxy &"
+	if grep -qF "$TPROXY_LINE" /etc/rc.local 2>/dev/null; then
+		# Remove the line containing xray-tproxy
+		sed -i '/\/usr\/bin\/xray-tproxy/d' /etc/rc.local >/dev/null 2>&1
+		log_success "Removed xray-tproxy from /etc/rc.local"
+	else
+		log_info "xray-tproxy not found in /etc/rc.local"
+	fi
+fi
+
+# =============================================================================
+# Remove xray Binary and Data Files
+# =============================================================================
+
+# Remove versioned binaries
+for _binary in /usr/bin/xray-*.*.*; do
+	if [ -f "$_binary" ]; then
+		rm -f "$_binary"
+		log_success "Removed $(basename "$_binary")"
+	fi
+done 2>/dev/null || true
+
+# Remove xray symlink
+rm -f /usr/bin/xray 2>/dev/null || true
+log_success "xray binaries removed"
+
+# Remove versioned geoip files
+for _geoip in /usr/bin/geoip-*.*.*.dat; do
+	if [ -f "$_geoip" ]; then
+		rm -f "$_geoip"
+		log_success "Removed $(basename "$_geoip")"
+	fi
+done 2>/dev/null || true
+
+# Remove versioned geosite files
+for _geosite in /usr/bin/geosite-*.*.*.dat; do
+	if [ -f "$_geosite" ]; then
+		rm -f "$_geosite"
+		log_success "Removed $(basename "$_geosite")"
+	fi
+done 2>/dev/null || true
+
+# Remove symlinks
+rm -f /usr/bin/geoip.dat 2>/dev/null || true
+rm -f /usr/bin/geosite.dat 2>/dev/null || true
+
+log_success "GeoIP and GeoSite files removed"
+
+# =============================================================================
+# Remove Configuration and Log
+# =============================================================================
+
+if [ -f /etc/xray/config.json ]; then
+	rm -f /etc/xray/config.json
+	log_success "Removed /etc/xray/config.json"
+fi
+
+if [ -d /var/log/xray ]; then
+	rm -rf /var/log/xray
+	log_success "Removed /var/log/xray"
+fi
+
+# =============================================================================
+# Summary
+# =============================================================================
+
+echo ""
+echo "============================================"
+log_success "Uninstall completed successfully!"
+echo "============================================"
+echo ""

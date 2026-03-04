@@ -1,0 +1,215 @@
+#!/bin/sh
+
+# Install Xray-core
+# This script installs xray binary, init scripts, and geo databases
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Source shared libraries
+. "${SCRIPT_DIR}/scripts/lib/logging.sh"
+. "${SCRIPT_DIR}/scripts/lib/download.sh"
+. "${SCRIPT_DIR}/scripts/lib/arch.sh"
+. "${SCRIPT_DIR}/scripts/lib/common.sh"
+
+# =============================================================================
+# Argument parsing
+# =============================================================================
+
+GITHUB_PROXY=""
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--github-proxy=*)
+		GITHUB_PROXY="${1#*=}"
+		shift
+		;;
+	-h | --help)
+		echo "Usage: $0 [OPTIONS]"
+		echo ""
+		echo "Options:"
+		echo "  --github-proxy=URL    Use GitHub mirror proxy (e.g., https://ghproxy.net)"
+		echo "                        https:// prefix is optional"
+		echo "  -h, --help            Show this help message"
+		echo ""
+		echo "This script will:"
+		echo "  - Download latest Xray-core release from GitHub"
+		echo "  - (https://github.com/XTLS/Xray-core)"
+		echo "  - Install xray binary, init scripts, and geo databases"
+		echo ""
+		exit 0
+		;;
+	*)
+		log_error "Unknown option: $1"
+		echo "Use --help for usage information"
+		exit 1
+		;;
+	esac
+done
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Detect system architecture
+CURRENT_OS=$(uname -s)
+CURRENT_ARCH=$(uname -m)
+
+# Detect Xray architecture and package name
+XRAY_ARCH_IDENTIFIER=$(detect_xray_arch)
+if [ -z "${XRAY_ARCH_IDENTIFIER}" ]; then
+	log_error "Unsupported architecture: ${CURRENT_ARCH}"
+	log_error "This script only supports common router architectures:"
+	log_error "  x86_64, i686, armv7l, aarch64, mips, mipsle, mips64, mips64le"
+	exit 1
+fi
+
+XRAY_ARCH="linux-${XRAY_ARCH_IDENTIFIER}"
+XRAY_PACKAGE="Xray-${XRAY_ARCH}.zip"
+TARGET_ARCH="${CURRENT_ARCH}"
+TARGET_OS="${CURRENT_OS}"
+
+# OpenWrt paths
+TEMP_DIR="/tmp/xray-deploy"
+DOWNLOAD_FILE="${TEMP_DIR}/${XRAY_PACKAGE}"
+BINARY_DIR="/usr/bin"
+CONFIG_DIR="/etc/xray"
+LOG_DIR="/var/log/xray"
+INIT_DIR="/etc/init.d"
+
+# =============================================================================
+# Check if xray is installed
+# =============================================================================
+
+if [ -f "${BINARY_DIR}/xray" ] &&
+	[ -f "${BINARY_DIR}/geoip.dat" ] &&
+	[ -f "${BINARY_DIR}/geosite.dat" ] &&
+	[ -f "${INIT_DIR}/xray" ]; then
+	log_success "Xray-core is already installed"
+	log_info "Run './upgrade' to upgrade to the latest version"
+	exit 0
+fi
+
+# =============================================================================
+# System Requirements Check
+# =============================================================================
+
+if [ "${CURRENT_OS}" != "Linux" ]; then
+	log_error "This script only supports Linux systems (found: ${CURRENT_OS})"
+	exit 1
+fi
+
+log_info "Detected system: ${CURRENT_OS} ${CURRENT_ARCH}"
+log_info "Using Xray package: ${XRAY_PACKAGE}"
+
+# =============================================================================
+# Prerequisites Check
+# =============================================================================
+
+if [ "$(id -u)" -ne 0 ]; then
+	log_error "This script must be run as root"
+	exit 1
+fi
+log_success "Running as root"
+
+MISSING=""
+if ! check_command curl; then
+	MISSING="${MISSING} curl"
+fi
+if ! check_command jq; then
+	MISSING="${MISSING} jq"
+fi
+if ! check_command wget; then
+	MISSING="${MISSING} wget"
+fi
+if ! check_command unzip; then
+	MISSING="${MISSING} unzip"
+fi
+
+if [ -n "${MISSING}" ]; then
+	log_info "Installing missing packages: ${MISSING}"
+	opkg update
+	opkg install "${MISSING}"
+	log_success "Installed missing packages"
+fi
+
+# =============================================================================
+# Install Xray-core
+# =============================================================================
+
+XRAY_VERSION=$(get_latest_xray_version) # e.g. "v1.2.3"
+log_success "Latest Xray-core version: ${XRAY_VERSION}"
+XRAY_RELEASE="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${XRAY_PACKAGE}"
+VERSION_TAG="${XRAY_VERSION#v}" # strip "v" prefix, e.g. "v1.2.3" -> "1.2.3"
+XRAY_VERSIONED="${BINARY_DIR}/xray-${VERSION_TAG}"
+GEOIP_VERSIONED="${BINARY_DIR}/geoip-${VERSION_TAG}.dat"
+GEOSITE_VERSIONED="${BINARY_DIR}/geosite-${VERSION_TAG}.dat"
+XRAY_SYMLINK="${BINARY_DIR}/xray"
+GEOIP_SYMLINK="${BINARY_DIR}/geoip.dat"
+GEOSITE_SYMLINK="${BINARY_DIR}/geosite.dat"
+
+if [ ! -d "${TEMP_DIR}" ]; then
+	mkdir -p "${TEMP_DIR}" || {
+		log_error "Failed to create temporary directory"
+		exit 1
+	}
+fi
+
+if [ ! -d "${CONFIG_DIR}" ]; then
+	mkdir -p "${CONFIG_DIR}" || {
+		log_error "Failed to create config directory"
+		exit 1
+	}
+fi
+
+if ! download_from_source "${DOWNLOAD_FILE}" "${XRAY_RELEASE}" "${GITHUB_PROXY}"; then
+	log_error "Failed to download Xray-core"
+	if [ -z "${GITHUB_PROXY}" ]; then
+		log_info "Please check your internet connection or use --github-proxy"
+	else
+		log_info "Please check if the proxy is working: ${GITHUB_PROXY}"
+	fi
+	exit 1
+fi
+
+cd "${TEMP_DIR}"
+unzip -o "${XRAY_PACKAGE}"
+cp xray "${XRAY_VERSIONED}" && chmod +x "${XRAY_VERSIONED}"
+cp geoip.dat "${GEOIP_VERSIONED}" && cp geosite.dat "${GEOSITE_VERSIONED}"
+rm -f "${XRAY_SYMLINK}" "${GEOIP_SYMLINK}" "${GEOSITE_SYMLINK}"
+ln -s "${XRAY_VERSIONED}" "${XRAY_SYMLINK}"
+ln -s "${GEOIP_VERSIONED}" "${GEOIP_SYMLINK}"
+ln -s "${GEOSITE_VERSIONED}" "${GEOSITE_SYMLINK}"
+
+# =============================================================================
+# Install Init Script
+# =============================================================================
+
+cp "${SCRIPT_DIR}/init.d/xray" ${INIT_DIR}/xray && chmod +x ${INIT_DIR}/xray
+
+# =============================================================================
+# Create Log Directory
+# =============================================================================
+
+mkdir -p "${LOG_DIR}"
+
+# =============================================================================
+# Summary
+# =============================================================================
+
+echo ""
+echo "============================================"
+log_success "Xray-core installation completed successfully!"
+log_success "Version ${XRAY_VERSION} installed"
+echo "============================================"
+echo ""
+echo "Installed files:"
+echo "  Binary:     ${XRAY_SYMLINK} -> ${XRAY_VERSIONED}"
+echo "  GeoIP:      ${GEOIP_SYMLINK} -> ${GEOIP_VERSIONED}"
+echo "  GeoSite:    ${GEOSITE_SYMLINK} -> ${GEOSITE_VERSIONED}"
+echo "  Init:       ${INIT_DIR}/xray"
+echo ""
+echo "Next step:"
+echo "  Run './configure --config=<path>' to setup xray and transparent proxy"
+echo ""

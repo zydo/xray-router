@@ -1,0 +1,12 @@
+# Backup files
+*.bak
+*.bak.*
+
+# Editor temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Log files
+*.log

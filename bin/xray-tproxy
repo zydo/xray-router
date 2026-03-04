@@ -1,0 +1,133 @@
+#!/bin/sh
+
+# TPROXY setup script
+#
+# This script runs at OS startup via rc.local to restore TPROXY iptables rules.
+#
+# WHY THIS SCRIPT IS NEEDED:
+# On many routers, TPROXY iptables rules do not persist across reboots. The
+# xray service will start and listen on port 5201, but without these iptables
+# rules, traffic from LAN clients will not be redirected to xray for proxying.
+#
+# This script ensures the TPROXY rules are properly restored after every reboot
+# by:
+# 1. Waiting for xray to start listening on port 5201
+# 2. Setting up the XRAY_TPROXY iptables chain with bypass rules
+# 3. Configuring policy routing to mark and redirect packets
+# 4. Applying the rules to the PREROUTING chain
+
+TPROXY_PORT=5201
+TPROXY_MARK=1
+ROUTING_TABLE=100
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
+is_xray_listening() {
+	local port="$1"
+
+	if command -v ss >/dev/null 2>&1; then
+		if ss -lnp 2>/dev/null | grep -q ":${port} "; then
+			return 0
+		fi
+	fi
+
+	if netstat -an 2>/dev/null | grep -q ":::${port} "; then
+		return 0
+	fi
+
+	if netstat -an 2>/dev/null | grep -E "0\.0\.0\.0:${port} |\*\.${port} " | grep -q "LISTEN"; then
+		return 0
+	fi
+
+	if netstat -an 2>/dev/null | grep -q ":${port}.*LISTEN"; then
+		return 0
+	fi
+
+	return 0
+}
+
+# =============================================================================
+# TPROXY Setup
+# =============================================================================
+
+setup_tproxy() {
+	logger -t xray-tproxy "Waiting for xray to be ready..."
+
+	local count=0
+	while [ $count -lt 60 ]; do
+		if is_xray_listening "${TPROXY_PORT}"; then
+			logger -t xray-tproxy "xray is listening on port ${TPROXY_PORT}"
+			break
+		fi
+		sleep 1
+		count=$((count + 1))
+	done
+
+	if ! is_xray_listening "${TPROXY_PORT}"; then
+		logger -t xray-tproxy "ERROR: xray not listening on port ${TPROXY_PORT} after 60 seconds"
+		return 1
+	fi
+
+	# Detect LAN interface - look for private network routes
+	LAN_IFACE=$(ip route | grep -E "192.168.0.0/16|172.16.0.0/12|10.0.0.0/8" | grep -v "default" | awk '{print $3}' | head -1)
+	[ -z "$LAN_IFACE" ] && LAN_IFACE="br-lan"
+
+	# Get router's LAN IP from the detected interface
+	LAN_IP=$(ip addr show "$LAN_IFACE" | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+
+	if [ -z "$LAN_IP" ]; then
+		logger -t xray-tproxy "ERROR: Failed to detect LAN IP on interface $LAN_IFACE"
+		return 1
+	fi
+
+	logger -t xray-tproxy "Setting up TPROXY on $LAN_IFACE (router IP: $LAN_IP)"
+
+	# Create custom chain for TPROXY rules
+	iptables -t mangle -N XRAY_TPROXY 2>/dev/null || iptables -t mangle -F XRAY_TPROXY
+
+	# Exclude localhost
+	iptables -t mangle -A XRAY_TPROXY -d 127.0.0.0/8 -j RETURN
+
+	# Exclude router's own IP
+	iptables -t mangle -A XRAY_TPROXY -s "$LAN_IP" -j RETURN
+
+	# Exclude local networks
+	iptables -t mangle -A XRAY_TPROXY -d 10.0.0.0/8 -j RETURN
+	iptables -t mangle -A XRAY_TPROXY -d 172.16.0.0/12 -j RETURN
+	iptables -t mangle -A XRAY_TPROXY -d 192.168.0.0/16 -j RETURN
+
+	# Exclude multicast and broadcast
+	iptables -t mangle -A XRAY_TPROXY -d 224.0.0.0/4 -j RETURN
+	iptables -t mangle -A XRAY_TPROXY -d 255.255.255.255/32 -j RETURN
+
+	# Exclude DNS (port 53)
+	iptables -t mangle -A XRAY_TPROXY -p tcp --dport 53 -j RETURN
+	iptables -t mangle -A XRAY_TPROXY -p udp --dport 53 -j RETURN
+
+	# Exclude DHCP (ports 67 and 68)
+	iptables -t mangle -A XRAY_TPROXY -p udp --dport 67 -j RETURN
+	iptables -t mangle -A XRAY_TPROXY -p udp --dport 68 -j RETURN
+
+	# Redirect TCP and UDP to TPROXY port (DHCP excluded above)
+	iptables -t mangle -A XRAY_TPROXY -p tcp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$TPROXY_MARK"
+	iptables -t mangle -A XRAY_TPROXY -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$TPROXY_MARK"
+
+	# Apply rules to PREROUTING chain
+	iptables -t mangle -D PREROUTING -i "$LAN_IFACE" -j XRAY_TPROXY 2>/dev/null
+	iptables -t mangle -A PREROUTING -i "$LAN_IFACE" -j XRAY_TPROXY
+
+	# Set up policy routing
+	ip route add local 0.0.0.0/0 dev lo table "$ROUTING_TABLE" 2>/dev/null
+	ip rule add fwmark "$TPROXY_MARK" lookup "$ROUTING_TABLE" 2>/dev/null
+
+	logger -t xray-tproxy "TPROXY rules installed successfully"
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+setup_tproxy
+logger -t xray-tproxy "xray-tproxy setup completed"
