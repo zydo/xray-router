@@ -1,0 +1,289 @@
+#!/bin/sh
+
+# Upgrade Xray-core to the latest version
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Source shared libraries
+. "${SCRIPT_DIR}/scripts/lib/logging.sh"
+. "${SCRIPT_DIR}/scripts/lib/download.sh"
+. "${SCRIPT_DIR}/scripts/lib/arch.sh"
+. "${SCRIPT_DIR}/scripts/lib/common.sh"
+
+# =============================================================================
+# Argument parsing
+# =============================================================================
+
+GITHUB_PROXY=""
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--github-proxy=*)
+		GITHUB_PROXY="${1#*=}"
+		shift
+		;;
+	-h | --help)
+		echo "Usage: $0 [OPTIONS]"
+		echo ""
+		echo "Options:"
+		echo "  --github-proxy=URL    Use GitHub mirror proxy (e.g., https://ghproxy.net)"
+		echo "                        https:// prefix is optional"
+		echo "  -h, --help            Show this help message"
+		echo ""
+		echo "This script will:"
+		echo "  - Check if xray is installed"
+		echo "  - Download latest Xray-core release from GitHub"
+		echo "  - (https://github.com/XTLS/Xray-core)"
+		echo "  - Upgrade Xray-core, keeping old versions for rollback"
+		echo ""
+		exit 0
+		;;
+	*)
+		log_error "Unknown option: $1"
+		echo "Use --help for usage information"
+		exit 1
+		;;
+	esac
+done
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Detect system architecture
+CURRENT_OS=$(uname -s)
+CURRENT_ARCH=$(uname -m)
+
+# Detect Xray architecture and package name
+XRAY_ARCH_IDENTIFIER=$(detect_xray_arch)
+if [ -z "${XRAY_ARCH_IDENTIFIER}" ]; then
+	log_error "Unsupported architecture: ${CURRENT_ARCH}"
+	log_error "This script only supports common router architectures:"
+	log_error "  x86_64, i686, armv7l, aarch64, mips, mipsle, mips64, mips64le"
+	exit 1
+fi
+
+XRAY_ARCH="linux-${XRAY_ARCH_IDENTIFIER}"
+XRAY_PACKAGE="Xray-${XRAY_ARCH}.zip"
+TARGET_ARCH="${CURRENT_ARCH}"
+TARGET_OS="${CURRENT_OS}"
+
+# OpenWrt paths
+TEMP_DIR="/tmp/xray-deploy"
+DOWNLOAD_FILE="${TEMP_DIR}/${XRAY_PACKAGE}"
+BINARY_DIR="/usr/bin"
+CONFIG_DIR="/etc/xray"
+INIT_DIR="/etc/init.d"
+
+# =============================================================================
+# Check if xray is installed
+# =============================================================================
+
+if [ ! -f "${BINARY_DIR}/xray" ]; then
+	log_error "Xray-core is not installed!"
+	echo ""
+	echo "Please run './install' first to install Xray-core"
+	exit 1
+fi
+
+# Get current version
+CURRENT_VERSION=$("${BINARY_DIR}/xray" version 2>/dev/null | head -1 | sed 's/.*Xray //' | sed 's/ .*//')
+log_info "Current version: ${CURRENT_VERSION}"
+
+# Get latest version
+LATEST_VERSION=$(get_latest_xray_version) # e.g. "v1.2.3"
+VERSION_TAG="${LATEST_VERSION#v}"         # strip "v" prefix, e.g. "v1.2.3" -> "1.2.3"
+
+log_info "Latest version: ${VERSION_TAG}"
+
+if [ "${CURRENT_VERSION}" = "${VERSION_TAG}" ]; then
+	log_success "Already at latest version!"
+	exit 0
+fi
+
+log_info "Upgrade available: ${CURRENT_VERSION} → ${LATEST_VERSION}"
+
+# =============================================================================
+# System Requirements Check
+# =============================================================================
+
+if [ "${CURRENT_OS}" != "Linux" ]; then
+	log_error "This script only supports Linux systems (found: ${CURRENT_OS})"
+	exit 1
+fi
+
+log_info "Detected system: ${CURRENT_OS} ${CURRENT_ARCH}"
+log_info "Using Xray package: ${XRAY_PACKAGE}"
+
+# =============================================================================
+# Prerequisites Check
+# =============================================================================
+
+if [ "$(id -u)" -ne 0 ]; then
+	log_error "This script must be run as root"
+	exit 1
+fi
+log_success "Running as root"
+
+MISSING=""
+if ! check_command curl; then
+	MISSING="${MISSING} curl"
+fi
+if ! check_command jq; then
+	MISSING="${MISSING} jq"
+fi
+if ! check_command wget; then
+	MISSING="${MISSING} wget"
+fi
+if ! check_command unzip; then
+	MISSING="${MISSING} unzip"
+fi
+
+if [ -n "${MISSING}" ]; then
+	log_info "Installing missing packages: ${MISSING}"
+	opkg update
+	opkg install "${MISSING}"
+	log_success "Installed missing packages"
+fi
+
+# =============================================================================
+# Stop xray Service
+# =============================================================================
+
+if [ -f ${INIT_DIR}/xray ]; then
+	if ${INIT_DIR}/xray status >/dev/null 2>&1; then
+		log_info "Stopping xray service..."
+		${INIT_DIR}/xray stop
+	fi
+else
+	log_info "xray service not installed"
+fi
+
+# Kill any remaining xray processes
+if pidof xray >/dev/null 2>&1; then
+	log_warn "Found running xray process, killing it..."
+	killall -9 xray 2>/dev/null || true
+fi
+
+# =============================================================================
+# Download and Install New Version
+# =============================================================================
+
+XRAY_VERSIONED="${BINARY_DIR}/xray-${VERSION_TAG}"
+GEOIP_VERSIONED="${BINARY_DIR}/geoip-${VERSION_TAG}.dat"
+GEOSITE_VERSIONED="${BINARY_DIR}/geosite-${VERSION_TAG}.dat"
+XRAY_SYMLINK="${BINARY_DIR}/xray"
+GEOIP_SYMLINK="${BINARY_DIR}/geoip.dat"
+GEOSITE_SYMLINK="${BINARY_DIR}/geosite.dat"
+
+XRAY_RELEASE="https://github.com/XTLS/Xray-core/releases/download/${LATEST_VERSION}/${XRAY_PACKAGE}"
+
+# Create temporary directory
+if [ ! -d "${TEMP_DIR}" ]; then
+	mkdir -p "${TEMP_DIR}" || {
+		log_error "Failed to create temporary directory"
+		exit 1
+	}
+fi
+
+if ! download_from_source "${DOWNLOAD_FILE}" "${XRAY_RELEASE}" "${GITHUB_PROXY}"; then
+	log_error "Failed to download Xray-core"
+	if [ -z "${GITHUB_PROXY}" ]; then
+		log_info "Please check your internet connection or use --github-proxy"
+	else
+		log_info "Please check if the proxy is working: ${GITHUB_PROXY}"
+	fi
+	exit 1
+fi
+
+cd "${TEMP_DIR}"
+unzip -o "${XRAY_PACKAGE}"
+cp xray "${XRAY_VERSIONED}" && chmod +x "${XRAY_VERSIONED}"
+cp geoip.dat "${GEOIP_VERSIONED}" && cp geosite.dat "${GEOSITE_VERSIONED}"
+rm -f "${XRAY_SYMLINK}" "${GEOIP_SYMLINK}" "${GEOSITE_SYMLINK}"
+ln -s "${XRAY_VERSIONED}" "${XRAY_SYMLINK}"
+ln -s "${GEOIP_VERSIONED}" "${GEOIP_SYMLINK}"
+ln -s "${GEOSITE_VERSIONED}" "${GEOSITE_SYMLINK}"
+
+# =============================================================================
+# Clean Up Old Versions (older than 90 days)
+# =============================================================================
+
+_current_time=$(date +%s)
+_cutoff_time=$((_current_time - 7776000)) # 90 days in seconds
+
+_xray_count=$(ls ${XRAY_SYMLINK}-*.*.* 2>/dev/null | wc -l)
+
+for _old_binary in ${XRAY_SYMLINK}-*.*.*; do
+	if [ -f "${_old_binary}" ] && [ "$(basename "${_old_binary}")" != "xray-${VERSION_TAG}" ]; then
+		_mtime=$(stat -c %Y "${_old_binary}" 2>/dev/null || stat -f %m "${_old_binary}" 2>/dev/null)
+		if [ -n "${_mtime}" ] && [ "${_mtime}" -lt "${_cutoff_time}" ]; then
+			if [ "${_xray_count}" -gt 1 ]; then
+				log_info "Removing old binary: $(basename "${_old_binary}")"
+				rm -f "${_old_binary}"
+				_xray_count=$((_xray_count - 1))
+			fi
+		fi
+	fi
+done
+
+_geoip_count=$(ls ${GEOIP_SYMLINK}-*.*.*.dat 2>/dev/null | wc -l)
+for _old_geoip in ${BINARY_DIR}/geoip-*.*.*.dat; do
+	if [ -f "${_old_geoip}" ] && [ "$(basename "${_old_geoip}")" != "geoip-${VERSION_TAG}.dat" ]; then
+		_mtime=$(stat -c %Y "${_old_geoip}" 2>/dev/null || stat -f %m "${_old_geoip}" 2>/dev/null)
+		if [ -n "${_mtime}" ] && [ "${_mtime}" -lt "${_cutoff_time}" ]; then
+			if [ "${_geoip_count}" -gt 1 ]; then
+				log_info "Removing old geoip.dat: $(basename "${_old_geoip}")"
+				rm -f "${_old_geoip}"
+				_geoip_count=$((_geoip_count - 1))
+			fi
+		fi
+	fi
+done
+
+_geosite_count=$(ls ${CONFIG_DIR}/geosite-*.*.*.dat 2>/dev/null | wc -l)
+for _old_geosite in ${GEOSITE_SYMLINK}-*.*.*.dat; do
+	if [ -f "${_old_geosite}" ] && [ "$(basename "${_old_geosite}")" != "geosite-${VERSION_TAG}.dat" ]; then
+		_mtime=$(stat -c %Y "${_old_geosite}" 2>/dev/null || stat -f %m "${_old_geosite}" 2>/dev/null)
+		if [ -n "${_mtime}" ] && [ "${_mtime}" -lt "${_cutoff_time}" ]; then
+			if [ "${_geosite_count}" -gt 1 ]; then
+				log_info "Removing old geosite.dat: $(basename "${_old_geosite}")"
+				rm -f "${_old_geosite}"
+				_geosite_count=$((_geosite_count - 1))
+			fi
+		fi
+	fi
+done
+
+# =============================================================================
+# Restart xray Service
+# =============================================================================
+
+# Enable and start xray service
+${INIT_DIR}/xray enable 2>/dev/null || true
+${INIT_DIR}/xray start
+
+# Wait a moment for service to start
+sleep 2
+
+# Verify service is running
+if ! ${INIT_DIR}/xray status >/dev/null 2>&1; then
+	log_error "Service does not appear to be running"
+	log_info "Check logs: logread -e xray"
+	exit 1
+fi
+
+log_success "xray restarted successfully"
+
+# =============================================================================
+# Summary
+# =============================================================================
+
+echo ""
+echo "============================================"
+log_success "Xray-core upgraded successfully!"
+log_success "Upgraded from ${CURRENT_VERSION} to ${LATEST_VERSION}"
+echo "============================================"
+echo ""

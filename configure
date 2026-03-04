@@ -1,0 +1,279 @@
+#!/bin/sh
+
+# Configure xray and setup TPROXY
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Source shared library
+. "${SCRIPT_DIR}/scripts/lib/logging.sh"
+. "${SCRIPT_DIR}/scripts/lib/common.sh"
+
+# =============================================================================
+# Argument parsing
+# =============================================================================
+
+CONFIG_FILE=""
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--help | -h)
+		echo "Usage: $0 --config=PATH"
+		echo ""
+		echo "Required arguments:"
+		echo "  --config=PATH    Path to config file"
+		echo ""
+		echo "Examples:"
+		echo "  $0 --config=config.json"
+		echo "  $0 --config=/path/to/my-config.json"
+		echo ""
+		echo "This script will:"
+		echo "  - Validate xray-core is installed"
+		echo "  - Stop existing xray and xray-tproxy services"
+		echo "  - Validate provided config file"
+		echo "  - Install config to /etc/xray/config.json"
+		echo "  - Start xray service"
+		echo "  - Install and immediately run xray-tproxy script to set up transparent proxy"
+		echo "  - Inject the command run xray-tproxy to rc.local to make it run on boot"
+		echo ""
+		exit 0
+		;;
+	--config=*)
+		CONFIG_FILE="${1#*=}"
+		shift
+		;;
+	--config)
+		shift
+		if [ $# -eq 0 ]; then
+			log_error "--config requires a path argument"
+			exit 1
+		fi
+		CONFIG_FILE="$1"
+		shift
+		;;
+	*)
+		log_error "Unknown option: $1"
+		echo "Use --help for usage information"
+		exit 1
+		;;
+	esac
+done
+
+# Validate required arguments
+if [ -z "${CONFIG_FILE}" ]; then
+	log_error "Missing required argument: --config"
+	echo ""
+	echo "Usage: $0 --config=PATH"
+	echo "Run '$0 --help' for more information"
+	exit 1
+fi
+
+# Convert relative path to absolute
+BINARY_DIR="/usr/bin"
+CONFIG_DIR="/etc/xray"
+INIT_DIR="/etc/init.d"
+
+# =============================================================================
+# Check if xray is installed
+# =============================================================================
+
+if [ ! -f "${BINARY_DIR}/xray" ]; then
+	log_error "xray-core is not installed!"
+	echo ""
+	echo "Please run './install' first to install xray-core"
+	exit 1
+fi
+
+# =============================================================================
+# Check for config file
+# =============================================================================
+
+if [ ! -f "${CONFIG_FILE}" ]; then
+	log_error "Config file not found: ${CONFIG_FILE}"
+	echo ""
+	echo "Please specify a config file using --config option, e.g.,:"
+	echo ""
+	echo "  ./configure --config=/path/to/config.json"
+	echo "  ./configure --config=my/config.json"
+	echo ""
+	exit 1
+fi
+
+# Validate JSON
+if ! jq empty "${CONFIG_FILE}" 2>/dev/null; then
+	log_error "Config file is malformed (invalid JSON): ${CONFIG_FILE}"
+	exit 1
+fi
+
+# =============================================================================
+# Validate config file (Xray config syntax)
+# =============================================================================
+
+${BINARY_DIR}/xray run -test -c "${CONFIG_FILE}" || {
+	log_error "Configuration validation failed"
+	log_error "Please check your ${CONFIG_FILE}"
+	echo ""
+	echo "  Documentation: https://xtls.github.io/en/config/"
+	echo ""
+	exit 1
+}
+
+# =============================================================================
+# Stop xray service
+# =============================================================================
+
+if [ -f ${INIT_DIR}/xray ]; then
+	if ${INIT_DIR}/xray status >/dev/null 2>&1; then
+		log_info "Stopping xray service..."
+		${INIT_DIR}/xray stop
+	fi
+else
+	log_info "xray service not installed"
+fi
+
+# Kill any remaining xray processes
+if pidof xray >/dev/null 2>&1; then
+	log_warn "Found running xray process, killing it..."
+	killall -9 xray 2>/dev/null || true
+fi
+
+# =============================================================================
+# Delete existing TPROXY (if present)
+# =============================================================================
+
+# Remove TPROXY iptables rules
+iptables -t mangle -D PREROUTING -i br-lan -j XRAY_TPROXY 2>/dev/null || true
+iptables -t mangle -F XRAY_TPROXY 2>/dev/null || true
+iptables -t mangle -X XRAY_TPROXY 2>/dev/null || true
+
+# Remove policy routing
+ip rule del fwmark 1 lookup 100 2>/dev/null || true
+ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
+
+# =============================================================================
+# Install configuration
+# =============================================================================
+
+# Check if config.json exists in target directory
+if [ -f "${CONFIG_DIR}/config.json" ]; then
+	# Compare existing config with source config
+	if cmp -s "${CONFIG_DIR}/config.json" "${CONFIG_FILE}"; then
+		log_info "Existing config.json is identical to source, keeping as-is"
+	else
+		# Configs are different, backup and replace
+		log_info "Existing config.json differs from source, backing up..."
+		BACKUP_TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
+		BACKUP_FILE="${CONFIG_DIR}/config.json.bak.${BACKUP_TIMESTAMP}"
+		cp "${CONFIG_DIR}/config.json" "${BACKUP_FILE}"
+		log_info "Backup created: ${BACKUP_FILE}"
+
+		# Copy config
+		cp "${CONFIG_FILE}" "${CONFIG_DIR}/config.json" || {
+			log_error "Failed to copy config.json"
+			exit 1
+		}
+		log_success "Installed config.json from ${CONFIG_FILE}"
+	fi
+else
+	# No existing config, just copy
+	cp "${CONFIG_FILE}" "${CONFIG_DIR}/config.json" || {
+		log_error "Failed to copy config.json"
+		exit 1
+	}
+	log_success "Installed config.json from ${CONFIG_FILE}"
+fi
+
+# =============================================================================
+# Enable and start xray service
+# =============================================================================
+
+${INIT_DIR}/xray enable
+${INIT_DIR}/xray start
+
+# Wait a moment for service to start
+sleep 2
+
+# Verify service is running
+if ! ${INIT_DIR}/xray status >/dev/null 2>&1; then
+	log_error "Service does not appear to be running"
+	log_info "Check logs: logread -e xray"
+	exit 1
+fi
+
+log_success "xray service is running"
+
+# =============================================================================
+# Setup TPROXY
+# =============================================================================
+
+# Install TPROXY script
+cp "${SCRIPT_DIR}/bin/xray-tproxy" /usr/bin/xray-tproxy
+chmod +x /usr/bin/xray-tproxy
+log_success "Installed TPROXY script: /usr/bin/xray-tproxy"
+
+# Add to rc.local for boot persistence
+RC_LOCAL="/etc/rc.local"
+TPROXY_LINE="/usr/bin/xray-tproxy &"
+
+if grep -qF "$TPROXY_LINE" "$RC_LOCAL" 2>/dev/null; then
+	log_info "xray-tproxy already in rc.local - skipping"
+else
+	# Check if there's an "exit 0" in rc.local
+	if grep -q "^exit 0" "$RC_LOCAL" 2>/dev/null; then
+		# Insert before exit 0 using sed
+		sed -i "/^exit 0/i\\
+$TPROXY_LINE" "$RC_LOCAL" || {
+			log_error "Failed to add xray-tproxy to rc.local (sed failed)"
+			exit 1
+		}
+	else
+		# Just append to the end
+		echo "" >>"$RC_LOCAL"
+		echo "$TPROXY_LINE" >>"$RC_LOCAL" || {
+			log_error "Failed to add xray-tproxy to rc.local"
+			exit 1
+		}
+	fi
+
+	# Verify it was added
+	if grep -qF "$TPROXY_LINE" "$RC_LOCAL"; then
+		log_success "Added xray-tproxy to rc.local"
+	else
+		log_error "Failed to verify xray-tproxy in rc.local"
+		exit 1
+	fi
+fi
+
+# Run xray-tproxy script
+log_info "Running xray-tproxy script..."
+/usr/bin/xray-tproxy >/tmp/xray-tproxy-startup.log 2>&1 &
+sleep 3
+
+# =============================================================================
+# Summary
+# =============================================================================
+
+echo ""
+echo "============================================"
+log_success "xray configured with TPROXY successfully!"
+echo "============================================"
+echo ""
+echo "Configuration:"
+echo "  Source:      ${CONFIG_FILE}"
+echo "  Installed:   ${CONFIG_DIR}/config.json"
+echo ""
+echo "Running:"
+echo "  xray:        Running with installed config"
+echo "  xray-tproxy: TPROXY setup successfully"
+echo ""
+echo "View logs:"
+echo "  logread -e xray"
+echo ""
+echo "TPROXY status:"
+echo "  iptables -t mangle -L XRAY_TPROXY -n -v"
+echo ""
+echo "Note: All LAN devices connected to this router are now using "
+echo "xray configured routing and outbounds automatically"
+echo ""
+echo ""
